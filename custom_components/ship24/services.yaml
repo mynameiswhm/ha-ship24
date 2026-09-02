@@ -1,3 +1,24 @@
+add_package:
+  name: Add Package
+  description: >
+    Add or import a package. If Ship24 already has a tracker for the tracking
+    number, that tracker is reused instead of creating a duplicate.
+  fields:
+    tracking_number:
+      name: Tracking Number
+      description: The package tracking number to add.
+      required: true
+      example: "1Z999AA10123456784"
+      selector:
+        text:
+    friendly_name:
+      name: Friendly Name
+      description: Optional local display name for Home Assistant and voice assistants.
+      required: false
+      example: "Amazon Order"
+      selector:
+        text:
+
 remove_package:
   name: Remove Package
   description: >

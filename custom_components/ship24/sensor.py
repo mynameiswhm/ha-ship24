@@ -8,12 +8,15 @@ from typing import Any
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    ATTR_CLIENT_TRACKER_ID,
     ATTR_COURIER,
     ATTR_DESTINATION_COUNTRY,
+    ATTR_DESTINATION_POST_CODE,
     ATTR_ESTIMATED_DELIVERY,
     ATTR_EVENTS,
     ATTR_FRIENDLY_NAME,
@@ -22,8 +25,11 @@ from .const import (
     ATTR_LAST_LOCATION,
     ATTR_ORIGIN_COUNTRY,
     ATTR_PACKAGE_COUNT,
+    ATTR_SHIPMENT_REFERENCE,
     ATTR_SPOKEN_SUMMARY,
     ATTR_STATUS_CODE,
+    ATTR_TITLE,
+    ATTR_TRACKER_ID,
     ATTR_TRACKING_NUMBER,
     DOMAIN,
 )
@@ -51,22 +57,81 @@ async def async_setup_entry(
     :return: None
     """
     coordinator: Ship24Coordinator = hass.data[DOMAIN][entry.entry_id]
-    known_tracking_numbers: set[str] = set()
+    known_package_ids: set[str] = set()
 
     async_add_entities([Ship24SummarySensor(coordinator, entry)])
 
     def _add_new_package_sensors() -> None:
-        """Add sensors for any tracking numbers not yet registered."""
-        current_numbers = set(coordinator.data or {})
-        new_numbers = current_numbers - known_tracking_numbers
-        if new_numbers:
-            known_tracking_numbers.update(new_numbers)
+        """Add sensors for any tracker IDs not yet registered."""
+        current_package_ids = set(coordinator.data or {})
+        new_package_ids = current_package_ids - known_package_ids
+        if new_package_ids:
+            _migrate_legacy_unique_ids(hass, entry, coordinator.data or {})
+            known_package_ids.update(new_package_ids)
             async_add_entities(
-                [Ship24PackageSensor(coordinator, tn) for tn in new_numbers]
+                [
+                    Ship24PackageSensor(coordinator, package_id)
+                    for package_id in new_package_ids
+                ]
             )
 
     _add_new_package_sensors()
     entry.async_on_unload(coordinator.async_add_listener(_add_new_package_sensors))
+
+
+def _migrate_legacy_unique_ids(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    packages: dict[str, dict[str, Any]],
+) -> None:
+    """
+    Move old tracking-number unique IDs to trackerId unique IDs when unambiguous.
+
+    Previous releases used ship24_<tracking_number>. That is ambiguous when
+    Ship24 has multiple trackers for the same number, so migration is only
+    attempted for one-to-one tracker number mappings.
+    """
+    registry = er.async_get(hass)
+    packages_by_number: dict[str, list[dict[str, Any]]] = {}
+    for package in packages.values():
+        tracking_number = package.get("tracking_number")
+        if tracking_number:
+            packages_by_number.setdefault(tracking_number, []).append(package)
+
+    for tracking_number, matching_packages in packages_by_number.items():
+        if len(matching_packages) != 1:
+            _LOGGER.debug(
+                "Not migrating legacy Ship24 unique ID for trackingNumber=%s; "
+                "%d trackers share that number",
+                tracking_number,
+                len(matching_packages),
+            )
+            continue
+
+        package = matching_packages[0]
+        tracker_id = package.get("tracker_id")
+        if not tracker_id:
+            continue
+
+        legacy_unique_id = f"{DOMAIN}_{tracking_number}"
+        new_unique_id = f"{DOMAIN}_{tracker_id}"
+        legacy_entity_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, legacy_unique_id
+        )
+        new_entity_id = registry.async_get_entity_id("sensor", DOMAIN, new_unique_id)
+        if not legacy_entity_id or new_entity_id:
+            continue
+
+        entity_entry = registry.async_get(legacy_entity_id)
+        if not entity_entry or entity_entry.config_entry_id != entry.entry_id:
+            continue
+
+        registry.async_update_entity(legacy_entity_id, new_unique_id=new_unique_id)
+        _LOGGER.debug(
+            "Migrated Ship24 entity unique ID from trackingNumber=%s to trackerId=%s",
+            tracking_number,
+            tracker_id,
+        )
 
 
 class Ship24SummarySensor(CoordinatorEntity[Ship24Coordinator], SensorEntity):
@@ -147,29 +212,29 @@ class Ship24PackageSensor(CoordinatorEntity[Ship24Coordinator], SensorEntity):
     def __init__(
         self,
         coordinator: Ship24Coordinator,
-        tracking_number: str,
+        package_id: str,
     ) -> None:
         """
         Initialize a Ship24 package sensor.
 
         param coordinator: The Ship24 data coordinator.
-        param tracking_number: The package tracking number this sensor represents.
+        param package_id: The Ship24 tracker ID this sensor represents.
         """
         super().__init__(coordinator)
-        self._tracking_number = tracking_number
-        self._attr_unique_id = f"{DOMAIN}_{tracking_number}"
+        self._package_id = package_id
+        self._attr_unique_id = f"{DOMAIN}_{package_id}"
         self._attr_name = None
 
     @property
     def _package_data(self) -> dict[str, Any] | None:
         """
-        Return the latest parsed data for this tracking number.
+        Return the latest parsed data for this package.
 
         :return: Dict with package fields, or None if not yet available.
         """
         if self.coordinator.data is None:
             return None
-        return self.coordinator.data.get(self._tracking_number)
+        return self.coordinator.data.get(self._package_id)
 
     @property
     def _display_name(self) -> str:
@@ -183,7 +248,10 @@ class Ship24PackageSensor(CoordinatorEntity[Ship24Coordinator], SensorEntity):
             alias = data.get("friendly_name", "")
             if alias:
                 return alias
-        return self._tracking_number
+            tracking_number = data.get("tracking_number")
+            if tracking_number:
+                return tracking_number
+        return self._package_id
 
     @property
     def native_value(self) -> str | None:
@@ -227,10 +295,15 @@ class Ship24PackageSensor(CoordinatorEntity[Ship24Coordinator], SensorEntity):
         if data is None:
             return {}
         return {
+            ATTR_TRACKER_ID: data.get("tracker_id", ""),
             ATTR_TRACKING_NUMBER: data.get("tracking_number", ""),
             ATTR_FRIENDLY_NAME: data.get("friendly_name", ""),
+            ATTR_TITLE: data.get("title", ""),
+            ATTR_CLIENT_TRACKER_ID: data.get("client_tracker_id", ""),
+            ATTR_SHIPMENT_REFERENCE: data.get("shipment_reference", ""),
             ATTR_STATUS_CODE: data.get("status_code", ""),
             ATTR_COURIER: data.get("courier", ""),
+            ATTR_DESTINATION_POST_CODE: data.get("destination_post_code", ""),
             ATTR_LAST_EVENT: data.get("last_event", ""),
             ATTR_LAST_EVENT_TIME: data.get("last_event_time", ""),
             ATTR_LAST_LOCATION: data.get("last_location", ""),
@@ -243,12 +316,12 @@ class Ship24PackageSensor(CoordinatorEntity[Ship24Coordinator], SensorEntity):
     @property
     def device_info(self) -> dict[str, Any]:
         """
-        Expose each package as its own HA device named by its friendly name or tracking number.
+        Expose each package as its own HA device.
 
         :return: Dict with device identifiers and metadata.
         """
         return {
-            "identifiers": {(DOMAIN, self._tracking_number)},
+            "identifiers": {(DOMAIN, self._package_id)},
             "name": self._display_name,
             "manufacturer": "Ship24",
             "model": "Package Tracker",

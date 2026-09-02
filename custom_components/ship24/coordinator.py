@@ -10,7 +10,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import Ship24Api, Ship24ApiError
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, STATUS_MAP
+from .const import (
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    STATUS_MAP,
+    SUPPRESSED_TRACKER_ID_PREFIX,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +38,8 @@ class Ship24Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         param api: An initialized Ship24Api client.
         param tracking_numbers: List of manually configured tracking numbers.
         param package_aliases: Optional dict mapping tracking number to friendly name.
-        param suppressed_numbers: List of tracking numbers to exclude from results.
+        param suppressed_numbers: List of tracking numbers or tracker-id
+            suppression keys to exclude from results.
 
         :return: None
         """
@@ -46,35 +52,141 @@ class Ship24Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self.tracking_numbers: list[str] = list(tracking_numbers)
         self.package_aliases: dict[str, str] = package_aliases or {}
-        self.suppressed_numbers: set[str] = set(suppressed_numbers or [])
+        self.suppressed_numbers, self.suppressed_tracker_ids = (
+            _split_suppressed_entries(suppressed_numbers or [])
+        )
+        self.trackers: dict[str, dict[str, Any]] = {}
 
     async def _async_update_data(self) -> dict[str, Any]:
         """
         Fetch updated tracking data from the Ship24 API.
 
-        Merges tracking numbers from the Ship24 account with any manually
-        configured numbers, so packages added on the Ship24 website are
-        automatically included.
+        Imports trackers from the Ship24 account and fetches results by
+        trackerId. This refresh path is read-only and must not create trackers.
 
-        :return: Dict keyed by tracking number with parsed package data.
+        :return: Dict keyed by Ship24 trackerId with parsed package data.
         """
         try:
-            account_numbers = await self.api.get_all_tracker_numbers()
-            all_numbers = [
-                n for n in set(self.tracking_numbers + account_numbers)
-                if n not in self.suppressed_numbers
+            account_trackers = await self.api.get_all_trackers()
+            trackers = [
+                tracker
+                for tracker in account_trackers
+                if not self.is_tracker_suppressed(tracker)
             ]
-            raw_trackings = await self.api.get_tracking_results(all_numbers)
+            self.trackers = {
+                tracker["trackerId"]: tracker
+                for tracker in trackers
+                if tracker.get("trackerId")
+            }
+            raw_trackings = await self.api.get_tracking_results_for_trackers(trackers)
         except Ship24ApiError as err:
             raise UpdateFailed(f"Error communicating with Ship24 API: {err}") from err
 
+        fetched_ids: set[str] = set()
         result: dict[str, Any] = {}
         for tracking in raw_trackings:
             parsed = _parse_tracking(tracking, self.package_aliases)
             if parsed:
-                result[parsed["tracking_number"]] = parsed
+                tracker_id = parsed["tracker_id"]
+                fetched_ids.add(tracker_id)
+                result[tracker_id] = parsed
+
+        for tracker_id, tracker in self.trackers.items():
+            if tracker_id in fetched_ids:
+                continue
+            parsed = _parse_tracking({"tracker": tracker}, self.package_aliases)
+            if parsed:
+                result[tracker_id] = parsed
+
+        configured_numbers = {number.upper() for number in self.tracking_numbers}
+        remote_numbers = {
+            str(tracker.get("trackingNumber", "")).upper()
+            for tracker in account_trackers
+            if tracker.get("trackingNumber")
+        }
+        missing_numbers = configured_numbers - remote_numbers - self.suppressed_numbers
+        if missing_numbers:
+            _LOGGER.debug(
+                "Configured Ship24 tracking number(s) have no existing tracker and "
+                "were not created during polling: %s",
+                sorted(missing_numbers),
+            )
 
         return result
+
+    async def async_add_package(
+        self,
+        tracking_number: str,
+        friendly_name: str = "",
+    ) -> dict[str, Any]:
+        """
+        Add or import a package from an explicit user action.
+
+        Existing Ship24 trackers with the same tracking number are reused so
+        enriched dashboard metadata is not replaced by a bare API tracker.
+
+        param tracking_number: The package tracking number to add.
+        param friendly_name: Optional local friendly name.
+
+        :return: The reused or created Ship24 tracker.
+        """
+        normalized_tracking_number = tracking_number.strip().upper()
+        trackers = await self.api.get_all_trackers()
+        matching_trackers = [
+            tracker
+            for tracker in trackers
+            if str(tracker.get("trackingNumber", "")).upper()
+            == normalized_tracking_number
+        ]
+
+        if matching_trackers:
+            tracker = matching_trackers[0]
+            if len(matching_trackers) > 1:
+                _LOGGER.debug(
+                    "Found %d existing Ship24 trackers for trackingNumber=%s; "
+                    "reusing trackerId=%s",
+                    len(matching_trackers),
+                    normalized_tracking_number,
+                    tracker.get("trackerId"),
+                )
+        else:
+            payload: dict[str, Any] = {"trackingNumber": normalized_tracking_number}
+            if friendly_name:
+                payload["title"] = friendly_name
+            tracker = await self.api.create_tracker(payload)
+
+        if friendly_name:
+            self.package_aliases[normalized_tracking_number] = friendly_name
+        self.suppressed_numbers.discard(normalized_tracking_number)
+        tracker_id = tracker.get("trackerId")
+        if tracker_id:
+            self.suppressed_tracker_ids.discard(str(tracker_id))
+        await self.async_request_refresh()
+        return tracker
+
+    def add_suppressed_entries(self, entries: list[str]) -> None:
+        """Add persisted suppression entries to the in-memory suppression sets."""
+        numbers, tracker_ids = _split_suppressed_entries(entries)
+        self.suppressed_numbers.update(numbers)
+        self.suppressed_tracker_ids.update(tracker_ids)
+
+    def is_tracker_suppressed(self, tracker: dict[str, Any]) -> bool:
+        """Return true if a raw Ship24 tracker is suppressed."""
+        tracker_id = str(tracker.get("trackerId") or "")
+        tracking_number = str(tracker.get("trackingNumber") or "").upper()
+        return (
+            bool(tracker_id and tracker_id in self.suppressed_tracker_ids)
+            or bool(tracking_number and tracking_number in self.suppressed_numbers)
+        )
+
+    def is_package_suppressed(self, package: dict[str, Any]) -> bool:
+        """Return true if a parsed package is suppressed."""
+        tracker_id = str(package.get("tracker_id") or "")
+        tracking_number = str(package.get("tracking_number") or "").upper()
+        return (
+            bool(tracker_id and tracker_id in self.suppressed_tracker_ids)
+            or bool(tracking_number and tracking_number in self.suppressed_numbers)
+        )
 
     def get_spoken_summary(self) -> str:
         """
@@ -108,7 +220,11 @@ class Ship24Coordinator(DataUpdateCoordinator[dict[str, Any]]):
             if location:
                 sentence += f" in {location}"
             if last_event_time:
-                event_date = last_event_time[:10] if len(last_event_time) >= 10 else last_event_time
+                event_date = (
+                    last_event_time[:10]
+                    if len(last_event_time) >= 10
+                    else last_event_time
+                )
                 sentence += f" on {event_date}"
             if eta and "delivered" not in status.lower():
                 eta_date = eta[:10] if len(eta) >= 10 else eta
@@ -140,7 +256,8 @@ def _parse_tracking(
     events: list[dict[str, Any]] = tracking.get("events", []) or []
 
     tracking_number: str | None = tracker.get("trackingNumber")
-    if not tracking_number:
+    tracker_id: str | None = tracker.get("trackerId")
+    if not tracking_number or not tracker_id:
         return None
 
     raw_status = (
@@ -170,22 +287,79 @@ def _parse_tracking(
         for e in sorted_events[:10]
     ]
 
-    friendly_name = (aliases or {}).get(tracking_number, "")
+    aliases = aliases or {}
+    friendly_name = (
+        aliases.get(tracking_number, "")
+        or aliases.get(tracking_number.upper(), "")
+        or tracker.get("title", "")
+    )
 
     return {
+        "tracker_id": tracker_id,
         "tracking_number": tracking_number,
         "friendly_name": friendly_name,
         "status": friendly_status,
         "status_code": raw_status,
         "courier": _get_courier(tracker, last_event),
+        "title": tracker.get("title", ""),
+        "client_tracker_id": tracker.get("clientTrackerId") or "",
+        "shipment_reference": tracker.get("shipmentReference") or "",
+        "destination_post_code": tracker.get("destinationPostCode") or "",
         "last_event": last_event.get("status", ""),
         "last_event_time": last_event.get("occurrenceDatetime", ""),
         "last_location": last_event.get("location", ""),
         "estimated_delivery": delivery.get("estimatedDeliveryDate") or "",
-        "origin_country": shipment.get("originCountryCode", ""),
-        "destination_country": shipment.get("destinationCountryCode", ""),
+        "origin_country": (
+            shipment.get("originCountryCode") or tracker.get("originCountryCode") or ""
+        ),
+        "destination_country": (
+            shipment.get("destinationCountryCode")
+            or tracker.get("destinationCountryCode")
+            or ""
+        ),
         "events": event_list,
     }
+
+
+def make_suppressed_tracker_id_key(tracker_id: Any) -> str:
+    """Build a persisted suppression key for one Ship24 tracker ID."""
+    normalized_tracker_id = str(tracker_id or "").strip()
+    if not normalized_tracker_id:
+        return ""
+    return f"{SUPPRESSED_TRACKER_ID_PREFIX}{normalized_tracker_id}"
+
+
+def normalize_suppressed_entry(entry: Any) -> str:
+    """Normalize a persisted suppression entry for stable comparisons."""
+    normalized_entry = str(entry or "").strip()
+    if not normalized_entry:
+        return ""
+
+    prefix_length = len(SUPPRESSED_TRACKER_ID_PREFIX)
+    if normalized_entry[:prefix_length].lower() == SUPPRESSED_TRACKER_ID_PREFIX:
+        tracker_id = normalized_entry[prefix_length:].strip()
+        return make_suppressed_tracker_id_key(tracker_id)
+
+    return normalized_entry.upper()
+
+
+def _split_suppressed_entries(entries: list[str]) -> tuple[set[str], set[str]]:
+    """Split persisted suppression entries into tracking numbers and tracker IDs."""
+    suppressed_numbers: set[str] = set()
+    suppressed_tracker_ids: set[str] = set()
+
+    for entry in entries:
+        normalized_entry = normalize_suppressed_entry(entry)
+        if not normalized_entry:
+            continue
+        if normalized_entry.startswith(SUPPRESSED_TRACKER_ID_PREFIX):
+            suppressed_tracker_ids.add(
+                normalized_entry[len(SUPPRESSED_TRACKER_ID_PREFIX) :]
+            )
+        else:
+            suppressed_numbers.add(normalized_entry)
+
+    return suppressed_numbers, suppressed_tracker_ids
 
 
 def _get_courier(tracker: dict[str, Any], last_event: dict[str, Any]) -> str:
@@ -200,5 +374,7 @@ def _get_courier(tracker: dict[str, Any], last_event: dict[str, Any]) -> str:
     for field in ("courierCode", "slug", "sourceCode"):
         value = tracker.get(field) or last_event.get(field)
         if value:
+            if isinstance(value, list):
+                return ", ".join(str(item) for item in value if item)
             return str(value)
     return ""

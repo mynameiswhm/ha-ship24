@@ -66,16 +66,16 @@ class Ship24Api:
         except aiohttp.ClientError as err:
             raise Ship24ApiError(f"Connection error during validation: {err}") from err
 
-    async def get_all_tracker_numbers(self) -> list[str]:
+    async def get_all_trackers(self) -> list[dict[str, Any]]:
         """
-        Fetch all tracking numbers registered in the Ship24 account.
+        Fetch all trackers registered in the Ship24 account.
 
         Handles pagination automatically, fetching up to 100 trackers per page.
 
-        :return: List of tracking number strings from the account.
+        :return: List of tracker dicts from the account.
         """
         url = f"{API_BASE_URL}/trackers"
-        tracking_numbers: list[str] = []
+        all_trackers: list[dict[str, Any]] = []
         page = 1
 
         while True:
@@ -98,9 +98,15 @@ class Ship24Api:
                     if not trackers:
                         break
                     for tracker in trackers:
-                        tn = tracker.get("trackingNumber")
-                        if tn:
-                            tracking_numbers.append(tn)
+                        tracker_id = tracker.get("trackerId")
+                        tracking_number = tracker.get("trackingNumber")
+                        if tracker_id and tracking_number:
+                            all_trackers.append(tracker)
+                            _LOGGER.debug(
+                                "Ship24 tracker discovered: trackerId=%s trackingNumber=%s",
+                                tracker_id,
+                                tracking_number,
+                            )
                     if len(trackers) < 100:
                         break
                     page += 1
@@ -110,36 +116,38 @@ class Ship24Api:
                 _LOGGER.warning("Connection error fetching tracker list: %s", err)
                 break
 
-        _LOGGER.debug("Found %d tracker(s) in Ship24 account", len(tracking_numbers))
-        return tracking_numbers
+        _LOGGER.debug("Found %d tracker(s) in Ship24 account", len(all_trackers))
+        return all_trackers
 
-    async def get_tracking_results(
-        self, tracking_numbers: list[str]
+    async def get_tracking_results_for_trackers(
+        self, trackers: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """
-        Fetch tracking results for the given list of tracking numbers.
+        Fetch tracking results for the given list of existing Ship24 trackers.
 
-        Uses POST /public/v1/trackers/track per tracking number, which creates
-        the tracker subscription if it does not exist (idempotent) and returns
-        the current tracking result in a single call.
+        Uses the read-only GET /public/v1/trackers/{trackerId}/results endpoint.
+        This method must never create or mutate remote Ship24 trackers.
 
-        param tracking_numbers: List of tracking number strings to query.
+        param trackers: List of tracker metadata dicts returned by Ship24.
 
-        :return: List of tracking result dicts, one per successfully fetched number.
+        :return: List of tracking result dicts, one per successfully fetched tracker.
         """
-        if not tracking_numbers:
+        if not trackers:
             return []
 
         results: list[dict[str, Any]] = []
-        url = f"{API_BASE_URL}/trackers/track"
 
-        for tracking_number in tracking_numbers:
-            payload = {"trackingNumber": tracking_number}
+        for tracker in trackers:
+            tracker_id = tracker.get("trackerId")
+            tracking_number = tracker.get("trackingNumber", "")
+            if not tracker_id:
+                continue
+
+            url = f"{API_BASE_URL}/trackers/{tracker_id}/results"
             try:
-                async with self._session.post(
+                async with self._session.get(
                     url,
                     headers=self._headers,
-                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
                 ) as response:
                     if response.status == 403:
@@ -147,8 +155,9 @@ class Ship24Api:
                     if response.status not in (200, 201):
                         text = await response.text()
                         _LOGGER.warning(
-                            "Ship24 returned status %d for %s: %s",
+                            "Ship24 returned status %d for trackerId=%s trackingNumber=%s: %s",
                             response.status,
+                            tracker_id,
                             tracking_number,
                             text,
                         )
@@ -157,14 +166,61 @@ class Ship24Api:
                     trackings = data.get("data", {}).get("trackings", [])
                     for tracking in trackings:
                         if tracking:
+                            tracking["tracker"] = {
+                                **(tracking.get("tracker") or {}),
+                                **tracker,
+                            }
                             results.append(tracking)
             except Ship24AuthError:
                 raise
             except aiohttp.ClientError as err:
                 _LOGGER.warning(
-                    "Connection error fetching %s: %s", tracking_number, err
+                    "Connection error fetching trackerId=%s trackingNumber=%s: %s",
+                    tracker_id,
+                    tracking_number,
+                    err,
                 )
                 continue
 
         _LOGGER.debug("Fetched %d tracking result(s) from Ship24", len(results))
         return results
+
+    async def create_tracker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Create a tracker from an explicit user action.
+
+        Uses POST /public/v1/trackers. Polling code must not call this method.
+
+        param payload: Ship24 tracker creation payload.
+
+        :return: Created or existing tracker dict returned by Ship24.
+        """
+        url = f"{API_BASE_URL}/trackers"
+        try:
+            async with self._session.post(
+                url,
+                headers=self._headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+            ) as response:
+                if response.status == 403:
+                    raise Ship24AuthError("Invalid or unauthorized API key")
+                if response.status not in (200, 201):
+                    text = await response.text()
+                    raise Ship24ApiError(
+                        f"Ship24 returned status {response.status} creating tracker: {text}"
+                    )
+                data = await response.json()
+                tracker = data.get("data", {}).get("tracker")
+                if not tracker:
+                    raise Ship24ApiError("Ship24 create tracker response had no tracker")
+                _LOGGER.debug(
+                    "Ship24 tracker created/reused: trackerId=%s trackingNumber=%s",
+                    tracker.get("trackerId"),
+                    tracker.get("trackingNumber"),
+                )
+                return tracker
+        except Ship24AuthError:
+            raise
+        except aiohttp.ClientError as err:
+            raise Ship24ApiError(f"Connection error creating tracker: {err}") from err

@@ -19,6 +19,20 @@
     }
   },
   "services": {
+    "add_package": {
+      "name": "Add Package",
+      "description": "Add or import a package without creating a duplicate Ship24 tracker.",
+      "fields": {
+        "tracking_number": {
+          "name": "Tracking Number",
+          "description": "The package tracking number to add."
+        },
+        "friendly_name": {
+          "name": "Friendly Name",
+          "description": "Optional local display name for Home Assistant and voice assistants."
+        }
+      }
+    },
     "remove_package": {
       "name": "Remove Package",
       "description": "Remove a package tracking number from monitoring.",

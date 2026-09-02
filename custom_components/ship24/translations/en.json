@@ -32,7 +32,7 @@
   "services": {
     "add_package": {
       "name": "Add Package",
-      "description": "Add a new package tracking number to monitor.",
+      "description": "Add or import a package without creating a duplicate Ship24 tracker.",
       "fields": {
         "tracking_number": {
           "name": "Tracking Number",

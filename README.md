@@ -1,7 +1,7 @@
 # Ship24 Package Tracker for Home Assistant
 
 Track your packages directly in Home Assistant using the [Ship24](https://ship24.com) API.
-No polling limits, no subscriptions. Just add your tracking numbers and go.
+Import your Ship24 trackers into Home Assistant and poll them safely by Ship24 tracker ID.
 
 [![GitHub Release](https://img.shields.io/github/v/release/szajbergyerek/ha-ship24?style=flat-square)](https://github.com/szajbergyerek/ha-ship24/releases)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)](https://github.com/hacs/integration)
@@ -20,7 +20,7 @@ No polling limits, no subscriptions. Just add your tracking numbers and go.
 - **Dashboard cards**: works with Entities, Glance, Mushroom, and any custom card
 - **Services** to add and remove packages dynamically from automations
 - **Friendly names**: name your packages (e.g. "Amazon Order") for display and voice
-- Polling interval: 1 hour (Ship24 creates a tracker subscription on first query, idempotent)
+- Polling interval: 1 hour. Refreshes are read-only and use Ship24 `trackerId`, so reloading Home Assistant does not create duplicate Ship24 trackers.
 
 ---
 
@@ -73,6 +73,7 @@ JD014600000000
 
 Click **Submit**. Home Assistant reloads and creates sensor entities for each package.
 The friendly name appears in the UI and is used by voice assistants instead of the long tracking number.
+Configured tracking numbers are matched to existing Ship24 trackers during read-only polling. Use the service below when you want Home Assistant to create a new Ship24 tracker.
 
 ### Via Service Call
 
@@ -84,6 +85,8 @@ data:
   tracking_number: "1Z999AA10123456784"
   friendly_name: "Amazon Order"   # optional
 ```
+
+`ship24.add_package` first checks the Ship24 account for an existing tracker with that tracking number. If one exists, Home Assistant imports it and keeps the existing Ship24 metadata such as courier, destination postcode, countries, and dashboard title. If none exists, the service creates one with `POST /trackers` and then polls future updates by the returned `trackerId`.
 
 Remove a package:
 
@@ -219,10 +222,15 @@ Each tracked package creates a sensor whose device name equals the friendly name
 | Attribute | Example |
 |-----------|---------|
 | **State** | `In Transit` |
+| `tracker_id` | `26148317-7502-d3ac-44a9-546d240ac0dd` |
 | `tracking_number` | `1Z999AA10123456784` |
 | `friendly_name` | `Amazon Order` |
+| `title` | `Nike shoes for Marc` |
+| `client_tracker_id` | `order-4242` |
+| `shipment_reference` | `DF14R2022` |
 | `status_code` | `in_transit` |
 | `courier` | `ups` |
+| `destination_post_code` | `08008` |
 | `last_event` | `Departed facility` |
 | `last_event_time` | `2024-03-15T14:30:00.000Z` |
 | `last_location` | `Frankfurt, DE` |
