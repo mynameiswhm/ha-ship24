@@ -12,6 +12,16 @@ from .const import API_BASE_URL, API_TIMEOUT
 _LOGGER = logging.getLogger(__name__)
 
 
+def is_active_tracker(tracker: dict[str, Any]) -> bool:
+    """
+    Return true if a Ship24 tracker should be monitored.
+
+    Ship24 marks dashboard-archived trackers with isSubscribed=false. Treat a
+    missing value as active for compatibility with older or partial responses.
+    """
+    return tracker.get("isSubscribed") is not False
+
+
 class Ship24ApiError(Exception):
     """Raised when the Ship24 API returns an error."""
 
@@ -68,11 +78,13 @@ class Ship24Api:
 
     async def get_all_trackers(self) -> list[dict[str, Any]]:
         """
-        Fetch all trackers registered in the Ship24 account.
+        Fetch active trackers registered in the Ship24 account.
 
         Handles pagination automatically, fetching up to 100 trackers per page.
+        Dashboard-archived trackers are skipped because Ship24 reports them as
+        isSubscribed=false and no longer uses them for tracking.
 
-        :return: List of tracker dicts from the account.
+        :return: List of active tracker dicts from the account.
         """
         url = f"{API_BASE_URL}/trackers"
         all_trackers: list[dict[str, Any]] = []
@@ -101,6 +113,14 @@ class Ship24Api:
                         tracker_id = tracker.get("trackerId")
                         tracking_number = tracker.get("trackingNumber")
                         if tracker_id and tracking_number:
+                            if not is_active_tracker(tracker):
+                                _LOGGER.debug(
+                                    "Skipping archived Ship24 tracker: trackerId=%s "
+                                    "trackingNumber=%s",
+                                    tracker_id,
+                                    tracking_number,
+                                )
+                                continue
                             all_trackers.append(tracker)
                             _LOGGER.debug(
                                 "Ship24 tracker discovered: trackerId=%s trackingNumber=%s",

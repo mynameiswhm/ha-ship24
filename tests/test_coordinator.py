@@ -395,6 +395,40 @@ async def test_trackers_with_same_tracking_number_are_not_collapsed():
     api.create_tracker.assert_not_called()
 
 
+async def test_archived_duplicate_tracker_is_not_pulled_into_data():
+    """An archived duplicate tracker is ignored while the active tracker remains."""
+    archived_tracker = make_tracker(
+        "archived",
+        "X",
+        isSubscribed=False,
+        courierCode="dpd",
+    )
+    active_tracker = make_tracker(
+        "active",
+        "X",
+        isSubscribed=True,
+        courierCode="dpd",
+        originCountryCode="NL",
+        destinationCountryCode="ES",
+    )
+    api = AsyncMock()
+    api.get_all_trackers.return_value = [archived_tracker, active_tracker]
+    api.get_tracking_results_for_trackers.return_value = [
+        make_tracking(active_tracker, status_code="data")
+    ]
+    api.create_tracker = AsyncMock()
+
+    coordinator = Ship24Coordinator(hass=MagicMock(), api=api, tracking_numbers=[])
+    result = await coordinator._async_update_data()
+
+    assert list(result) == ["active"]
+    assert result["active"]["tracking_number"] == "X"
+    assert result["active"]["status_code"] == "data"
+    assert result["active"]["origin_country"] == "NL"
+    api.get_tracking_results_for_trackers.assert_awaited_once_with([active_tracker])
+    api.create_tracker.assert_not_called()
+
+
 async def test_suppressed_numbers_are_normalized_before_compare():
     """Persisted legacy suppressed tracking numbers are matched case-insensitively."""
     tracker = make_tracker("A", "X")
@@ -471,6 +505,24 @@ async def test_explicit_add_reuses_existing_tracker():
     assert result == tracker
     assert coordinator.package_aliases["X"] == "Package X"
     api.create_tracker.assert_not_called()
+    coordinator.async_request_refresh.assert_awaited_once()
+
+
+async def test_explicit_add_ignores_archived_matching_tracker():
+    """Adding a package does not reuse an archived tracker with the same number."""
+    archived_tracker = make_tracker("A", "X", isSubscribed=False, courierCode="dpd")
+    new_tracker = make_tracker("B", "X", isSubscribed=True, courierCode="dpd")
+    api = AsyncMock()
+    api.get_all_trackers.return_value = [archived_tracker]
+    api.create_tracker.return_value = new_tracker
+
+    coordinator = Ship24Coordinator(hass=MagicMock(), api=api, tracking_numbers=[])
+    coordinator.async_request_refresh = AsyncMock()
+
+    result = await coordinator.async_add_package("x")
+
+    assert result == new_tracker
+    api.create_tracker.assert_awaited_once_with({"trackingNumber": "X"})
     coordinator.async_request_refresh.assert_awaited_once()
 
 

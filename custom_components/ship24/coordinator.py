@@ -9,7 +9,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import Ship24Api, Ship24ApiError
+from .api import Ship24Api, Ship24ApiError, is_active_tracker
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -67,7 +67,11 @@ class Ship24Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         :return: Dict keyed by Ship24 trackerId with parsed package data.
         """
         try:
-            account_trackers = await self.api.get_all_trackers()
+            account_trackers = [
+                tracker
+                for tracker in await self.api.get_all_trackers()
+                if is_active_tracker(tracker)
+            ]
             trackers = [
                 tracker
                 for tracker in account_trackers
@@ -131,7 +135,11 @@ class Ship24Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         :return: The reused or created Ship24 tracker.
         """
         normalized_tracking_number = tracking_number.strip().upper()
-        trackers = await self.api.get_all_trackers()
+        trackers = [
+            tracker
+            for tracker in await self.api.get_all_trackers()
+            if is_active_tracker(tracker)
+        ]
         matching_trackers = [
             tracker
             for tracker in trackers

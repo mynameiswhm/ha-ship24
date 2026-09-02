@@ -83,6 +83,35 @@ async def test_tracking_results_use_tracker_id_read_endpoint():
     assert session.post_calls == []
 
 
+async def test_get_all_trackers_skips_archived_trackers():
+    """Dashboard-archived trackers are not returned for monitoring."""
+    session = FakeSession(
+        [
+            {
+                "data": {
+                    "trackers": [
+                        {
+                            "trackerId": "archived",
+                            "trackingNumber": "X",
+                            "isSubscribed": False,
+                        },
+                        {
+                            "trackerId": "active",
+                            "trackingNumber": "X",
+                            "isSubscribed": True,
+                        },
+                    ]
+                }
+            }
+        ]
+    )
+    api = Ship24Api("api_key", session)  # type: ignore[arg-type]
+
+    trackers = await api.get_all_trackers()
+
+    assert [tracker["trackerId"] for tracker in trackers] == ["active"]
+
+
 async def test_create_tracker_uses_create_endpoint():
     """Explicit creation uses POST /trackers, not POST /trackers/track."""
     session = FakeSession()
